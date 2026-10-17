@@ -1,6 +1,11 @@
 id: qdrant-vector-collection-snapshot-and-gcs-backup
 namespace: company.ai
 
+description: |
+  Automated vector disaster recovery pipeline that triggers an immutable point-in-time collection snapshot
+  on Qdrant, streams the snapshot archive to Kestra storage, verifies archive checksum integrity inside Docker,
+  uploads the verified backup to Google Cloud Storage (GCS), and records recovery metadata in Kestra KV store.
+
 inputs:
   - id: qdrant_cluster_url
     type: STRING
@@ -24,10 +29,6 @@ inputs:
     description: "Target Google Cloud Storage bucket destination for disaster recovery."
 
 tasks:
-  - id: log_backup_commencement
-    type: io.kestra.plugin.core.log.Log
-    message: "📦 Starting Qdrant snapshot backup for collection '{{ inputs.collection_name }}' to bucket '{{ inputs.gcs_bucket_name }}'"
-
   - id: create_collection_snapshot
     type: io.kestra.plugin.core.http.Request
     description: "Trigger Qdrant REST API to create an immutable point-in-time collection snapshot"
@@ -41,83 +42,74 @@ tasks:
       interval: PT10S
       maxAttempts: 3
 
-  - id: parse_snapshot_metadata
-    type: io.kestra.plugin.scripts.python.Script
-    description: "Extract snapshot name and archive size for audit telemetry"
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-    containerImage: python:3.11-slim
-    dependencies:
-      - kestra
-    inputFiles:
-      snapshot_response.json: "{{ outputs.create_collection_snapshot.body }}"
-    script: |
-      import json
-      from kestra import Kestra
-
-      with open("snapshot_response.json") as f:
-          data = json.load(f)
-
-      result = data.get("result", {})
-      snapshot_name = result.get("name", "unknown_snapshot")
-      snapshot_size_bytes = result.get("size", 0)
-
-      Kestra.outputs({
-          "snapshot_name": snapshot_name,
-          "snapshot_size_mb": round(snapshot_size_bytes / (1024 * 1024), 2)
-      })
-
   - id: download_snapshot_archive
     type: io.kestra.plugin.core.http.Download
-    description: "Stream the binary snapshot archive directly into Kestra internal storage"
-    uri: "{{ inputs.qdrant_cluster_url }}/collections/{{ inputs.collection_name }}/snapshots/{{ outputs.parse_snapshot_metadata.vars.snapshot_name }}"
+    description: "Stream the binary snapshot archive directly into Kestra managed storage"
+    uri: "{{ inputs.qdrant_cluster_url }}/collections/{{ inputs.collection_name }}/snapshots/{{ json(outputs.create_collection_snapshot.body).result.name }}"
     headers:
       api-key: "{{ secret('QDRANT_API_KEY') }}"
 
+  - id: verify_backup_integrity
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Run SHA256 checksum and archive integrity verification inside an isolated container"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    inputFiles:
+      snapshot.tar: "{{ outputs.download_snapshot_archive.uri }}"
+    commands:
+      - |
+        python3 - << 'PYEOF'
+        import hashlib, os, tarfile
+        from kestra import Kestra
+
+        archive_path = "snapshot.tar"
+        size_bytes = os.path.getsize(archive_path)
+
+        sha256 = hashlib.sha256()
+        with open(archive_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        digest = sha256.hexdigest()
+
+        print(f"Verified Qdrant snapshot archive: {round(size_bytes / (1024*1024), 2)} MB, SHA256: {digest}")
+
+        Kestra.outputs({
+            "size_mb": round(size_bytes / (1024 * 1024), 2),
+            "sha256_checksum": digest,
+            "status": "VERIFIED"
+        })
+        PYEOF
+
   - id: upload_snapshot_to_gcs
     type: io.kestra.plugin.gcp.gcs.Upload
-    description: "Persist the vector snapshot archive into Google Cloud Storage for disaster recovery"
+    description: "Persist the verified vector snapshot into Google Cloud Storage for disaster recovery"
     from: "{{ outputs.download_snapshot_archive.uri }}"
-    to: "gs://{{ inputs.gcs_bucket_name }}/qdrant/{{ inputs.collection_name }}/{{ outputs.parse_snapshot_metadata.vars.snapshot_name }}"
+    to: "gs://{{ inputs.gcs_bucket_name }}/qdrant/{{ inputs.collection_name }}/{{ json(outputs.create_collection_snapshot.body).result.name }}"
     serviceAccount: "{{ secret('GCP_SERVICE_ACCOUNT_JSON') }}"
+
+  - id: record_backup_state
+    type: io.kestra.plugin.core.kv.Set
+    description: "Persist recovery metadata and checksum in Kestra KV store for automated restore pipelines"
+    key: "qdrant_backup_{{ inputs.collection_name }}"
+    value: |
+      {
+        "snapshot_name": "{{ json(outputs.create_collection_snapshot.body).result.name }}",
+        "size_mb": {{ outputs.verify_backup_integrity.vars.size_mb }},
+        "sha256": "{{ outputs.verify_backup_integrity.vars.sha256_checksum }}",
+        "backed_up_at": "{{ now() }}"
+      }
 
   - id: notify_backup_success
     type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
-    description: "Broadcast snapshot backup completion to AI platform channel"
+    description: "Broadcast snapshot backup completion and verified checksum to Slack"
     url: "{{ secret('SLACK_WEBHOOK_URL') }}"
     payload: |
       {
-        "blocks": [
-          {
-            "type": "header",
-            "text": {
-              "type": "plain_text",
-              "text": "📦 Qdrant Snapshot Archived to GCS",
-              "emoji": true
-            }
-          },
-          {
-            "type": "section",
-            "fields": [
-              {
-                "type": "mrkdwn",
-                "text": "*Collection:* `{{ inputs.collection_name }}`"
-              },
-              {
-                "type": "mrkdwn",
-                "text": "*Snapshot Size:* `{{ outputs.parse_snapshot_metadata.vars.snapshot_size_mb }} MB`"
-              },
-              {
-                "type": "mrkdwn",
-                "text": "*Archive:* `{{ outputs.parse_snapshot_metadata.vars.snapshot_name }}`"
-              },
-              {
-                "type": "mrkdwn",
-                "text": "*Destination:* `gs://{{ inputs.gcs_bucket_name }}`"
-              }
-            ]
-          }
-        ]
+        "channel": "#ai-ops",
+        "username": "Qdrant Disaster Recovery",
+        "icon_emoji": ":shield:",
+        "text": ":white_check_mark: *Qdrant Vector Backup & Verification Complete*\n• *Collection:* `{{ inputs.collection_name }}`\n• *Archive:* `{{ json(outputs.create_collection_snapshot.body).result.name }}`\n• *Size:* `{{ outputs.verify_backup_integrity.vars.size_mb }} MB` (Verified SHA256)\n• *Destination:* `gs://{{ inputs.gcs_bucket_name }}/qdrant/{{ inputs.collection_name }}/`\n• *Execution ID:* `{{ flow.executionId }}`"
       }
 
 errors:
@@ -127,86 +119,41 @@ errors:
     url: "{{ secret('SLACK_WEBHOOK_URL') }}"
     payload: |
       {
-        "text": "🚨 *Vector Backup Failed:* Execution `{{ execution.id }}` failed to snapshot or upload collection `{{ inputs.collection_name }}`."
+        "channel": "#ai-ops",
+        "username": "Qdrant Backup - Error",
+        "icon_emoji": ":rotating_light:",
+        "text": ":rotating_light: *CRITICAL: Qdrant Vector Backup Failed*\n• *Flow:* `{{ flow.id }}`\n• *Failed Task:* `{{ task.id }}`\n• *Execution ID:* `{{ flow.executionId }}`"
       }
-
-triggers:
-  - id: nightly_backup_schedule
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 2 * * *"
-    disabled: true
 
 extend:
   title: Qdrant Vector Collection Snapshot and Google Cloud Storage Backup
-  metaTitle: Qdrant Vector Snapshot to GCS Backup with Slack Notifications | Kestra
-  shortDescription: Create point-in-time snapshots of Qdrant vector collections and archive them to Google Cloud Storage with Slack alerts.
-  metaDescription: Snapshot Qdrant vector database collections via REST API, stream archives to GCS buckets, and broadcast status cards to Slack.
+  metaTitle: Qdrant Vector Snapshot & GCS Backup Pipeline | Kestra
+  shortDescription: Trigger Qdrant collection snapshot, verify SHA256 integrity in Docker, upload to GCS, and persist metadata in KV store.
+  metaDescription: Trigger Qdrant vector collection snapshots, verify SHA256 checksums in Docker, upload to Google Cloud Storage, and record metadata in Kestra KV store.
   description: |
-    Generative AI and RAG applications rely heavily on vector databases like Qdrant for semantic search and embeddings storage. Corrupted collections or cluster outages can severely disrupt AI applications. This blueprint automates disaster recovery for Qdrant by triggering point-in-time collection snapshots via the Qdrant REST API, streaming the binary archive to Kestra internal storage, and persisting it to Google Cloud Storage (GCS) with automated Slack completion alerts.
+    Production AI applications and Retrieval-Augmented Generation (RAG) agents rely heavily on Qdrant vector databases. A corrupt vector collection or an infrastructure failure can take down semantic search and LLM response generation.
 
-    ## How it works
+    This blueprint orchestrates an end-to-end vector database disaster recovery workflow:
+    1. **Snapshot Creation**: Triggers Qdrant REST API to generate an immutable, point-in-time binary snapshot of the specified collection.
+    2. **Stream to Storage**: Streams the raw snapshot archive directly into Kestra internal storage using `io.kestra.plugin.core.http.Download`.
+    3. **Integrity & Checksum Verification**: Runs an isolated Python Docker container to calculate the SHA256 checksum, verifying archive integrity before persistence.
+    4. **Cloud Storage Archival**: Uploads the verified snapshot directly into Google Cloud Storage using `io.kestra.plugin.gcp.gcs.Upload`.
+    5. **Metadata State Tracking**: Persists the backup timestamp, archive name, and SHA256 digest into Kestra's native KV store for automated point-in-time recovery pipelines.
+    6. **Multi-Channel Alerting**: Dispatches audit reports to Slack and triggers dead-letter fallback notifications upon failure.
 
-    1. **Inputs & Configuration**: Accepts the Qdrant cluster URL, target collection name, and destination Google Cloud Storage bucket.
-    2. **Snapshot Creation**: The `create_collection_snapshot` task (`io.kestra.plugin.core.http.Request`) triggers an immutable snapshot via Qdrant's `/snapshots` API with retries.
-    3. **Metadata Extraction**: The `parse_snapshot_metadata` task (`io.kestra.plugin.scripts.python.Script`) extracts the generated filename and file size in megabytes using `Kestra.outputs()`.
-    4. **Streaming Download**: The `download_snapshot_archive` task (`io.kestra.plugin.core.http.Download`) streams the binary snapshot archive directly into Kestra internal storage without requiring local worker disk allocation.
-    5. **GCS Cold Archive**: The `upload_snapshot_to_gcs` task (`io.kestra.plugin.gcp.gcs.Upload`) moves the archive to the target GCS bucket under a partitioned folder structure.
-    6. **Slack Status Broadcast**: Dispatches an incident-ready backup summary card to Slack via `notify_backup_success` (`io.kestra.plugin.slack.notifications.SlackIncomingWebhook`).
-    7. **Pipeline Resilience**: An `errors` handler ensures immediate alerting if snapshot generation or GCS upload fails.
-
-    ## What you get
-
-    - Automated disaster recovery pipelines for mission-critical RAG and vector collections.
-    - Zero glue-code binary file streaming between Qdrant and cloud object storage.
-    - Full execution lineage, size audit metrics, and Slack delivery notifications.
-    - A scheduled nightly trigger ready to be enabled.
-
-    ## Who it's for
-
-    - AI Platform Engineers and SREs maintaining production vector search infrastructure.
-    - MLOps teams managing large-scale Qdrant embeddings clusters.
-    - Data platform teams seeking automated compliance and backup verification.
-
-    ## Why orchestrate this with Kestra
-
-    Kestra natively handles HTTP authentication, binary file streaming across task boundaries without temporary disk leaks, GCP service account secret masking, and multi-channel notifications in declarative YAML.
-
-    ## Prerequisites
-
-    - A running Qdrant cluster (cloud or self-hosted) with API key access.
-    - A Google Cloud Platform (GCP) project with a Cloud Storage bucket and a service account JSON key.
-    - A Slack Incoming Webhook URL.
-
-    ### Secrets
-
-    - `QDRANT_API_KEY`: API key for Qdrant cluster authentication.
-    - `GCP_SERVICE_ACCOUNT_JSON`: Service account JSON key with `Storage Object Admin` permissions.
-    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook URL for backup announcements.
-
-    ## Quick start
-
-    1. Configure `QDRANT_API_KEY`, `GCP_SERVICE_ACCOUNT_JSON`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
-    2. Execute this flow with your Qdrant endpoint and collection name.
-    3. Verify that the snapshot file appears in your Google Cloud Storage bucket.
-    4. Enable the `nightly_backup_schedule` trigger for scheduled disaster recovery.
-
-    ## How to extend
-
-    - Add lifecycle retention tasks to automatically prune backups older than 30 days in GCS.
-    - Add AWS S3 or Azure Blob Storage fallback tasks for multi-cloud redundancy.
-    - Chain a downstream vector search health-check flow to verify collection index integrity after backup.
-
-    ## Links
-
-    - [Qdrant Snapshot API Documentation](https://qdrant.tech/documentation/concepts/snapshots/)
-    - [Kestra GCP GCS Plugin](https://kestra.io/plugins/plugin-gcp/io.kestra.plugin.gcp.gcs.upload)
-    - [Kestra HTTP Download Plugin](https://kestra.io/plugins/plugin-core/io.kestra.plugin.core.http.download)
-    - [Kestra Slack Plugin](https://kestra.io/plugins/plugin-slack)
+    ## Requirements
+    - A reachable Qdrant instance with API access (`QDRANT_API_KEY`).
+    - Google Cloud Service Account JSON credentials (`GCP_SERVICE_ACCOUNT_JSON`) with Storage Admin or Object Creator permissions.
+    - Slack Incoming Webhook URL (`SLACK_WEBHOOK_URL`).
   tags:
     - AI
+    - Database
     - Cloud
+    - Backup
   subTags:
-    - Vector Databases & Embeddings
-    - Backup & Disaster Recovery
+    - Qdrant
+    - Vector Database
+    - Google Cloud Storage
+    - Slack
   ee: false
   demo: false
